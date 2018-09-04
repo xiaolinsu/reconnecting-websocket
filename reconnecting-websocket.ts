@@ -5,6 +5,10 @@
  * License MIT
  */
 import {CloseEvent, ErrorEvent, Event, EventListener, WebSocketEventMap} from './events';
+import RNTimer from "react-native-background-timer";
+
+const _setTimeout = RNTimer ? (callback: () => void, time: number) => RNTimer.setTimeout(callback, time) : setTimeout;
+const _clearTimeout = RNTimer ? (time: number) => RNTimer.clearTimeout(time) : clearTimeout;
 
 const getGlobalWebSocket = (): WebSocket | undefined => {
     if (typeof WebSocket !== 'undefined') {
@@ -276,7 +280,7 @@ export default class ReconnectingWebSocket {
 
     private _wait(): Promise<void> {
         return new Promise(resolve => {
-            setTimeout(resolve, this._getNextDelay());
+            _setTimeout(resolve, this._getNextDelay());
         });
     }
 
@@ -332,7 +336,7 @@ export default class ReconnectingWebSocket {
                 this._ws!.binaryType = this._binaryType;
                 this._connectLock = false;
                 this._addListeners();
-                this._connectTimeout = setTimeout(() => this._handleTimeout(), connectionTimeout);
+                this._connectTimeout = _setTimeout(() => this._handleTimeout(), connectionTimeout);
             });
     }
 
@@ -342,7 +346,7 @@ export default class ReconnectingWebSocket {
     }
 
     private _disconnect(code?: number, reason?: string) {
-        clearTimeout(this._connectTimeout);
+        _clearTimeout(this._connectTimeout);
         if (!this._ws) {
             return;
         }
@@ -363,8 +367,8 @@ export default class ReconnectingWebSocket {
         this._debug('open event');
         const {minUptime = DEFAULT.minUptime} = this._options;
 
-        clearTimeout(this._connectTimeout);
-        this._uptimeTimeout = setTimeout(() => this._acceptOpen(), minUptime);
+        _clearTimeout(this._connectTimeout);
+        this._uptimeTimeout = _setTimeout(() => this._acceptOpen(), minUptime);
 
         this._debug('assign binary type');
         // @ts-ignore
