@@ -304,11 +304,10 @@ export default class ReconnectingWebSocket {
     }
 
     private _connect() {
-        if (this._connectLock) {
+        if (this._connectLock || !this._shouldReconnect) {
             return;
         }
         this._connectLock = true;
-
         const {
             maxRetries = DEFAULT.maxRetries,
             connectionTimeout = DEFAULT.connectionTimeout,

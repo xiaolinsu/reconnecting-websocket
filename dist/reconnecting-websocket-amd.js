@@ -260,7 +260,7 @@ define(['react-native-background-timer'], function (RNTimer) { 'use strict';
             throw Error('Invalid URL');
         }
         _connect() {
-            if (this._connectLock) {
+            if (this._connectLock || !this._shouldReconnect) {
                 return;
             }
             this._connectLock = true;

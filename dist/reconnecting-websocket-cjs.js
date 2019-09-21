@@ -262,7 +262,7 @@ class ReconnectingWebSocket {
         throw Error('Invalid URL');
     }
     _connect() {
-        if (this._connectLock) {
+        if (this._connectLock || !this._shouldReconnect) {
             return;
         }
         this._connectLock = true;
