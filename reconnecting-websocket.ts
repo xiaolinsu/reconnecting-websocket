@@ -386,9 +386,8 @@ export default class ReconnectingWebSocket {
                 // @ts-ignore
                 this._ws!.binaryType = this._binaryType;
                 this._connectLock = false;
-                this._addListeners();
-
                 this._connectTimeout = _setTimeout(() => this._handleTimeout(), connectionTimeout);
+                this._addListeners();
             });
     }
 
@@ -459,7 +458,7 @@ export default class ReconnectingWebSocket {
     };
 
     private _handleError = (event: ErrorEvent) => {
-        this._debug('error event', event.message);
+        this._debug('error event', event);
         this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
 
         if (this.onerror) {
