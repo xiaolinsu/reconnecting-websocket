@@ -43,7 +43,7 @@ const getGlobalWebSocket = () => {
 /**
  * Returns true if given argument looks like a WebSocket class
  */
-const isWebSocket = (w) => typeof w === 'function' && w.CLOSING === 2;
+const isWebSocket = (w) => typeof w !== 'undefined' && !!w && w.CLOSING === 2;
 const DEFAULT = {
     maxReconnectionDelay: 10000,
     minReconnectionDelay: 1000 + Math.random() * 4000,
@@ -51,6 +51,8 @@ const DEFAULT = {
     reconnectionDelayGrowFactor: 1.3,
     connectionTimeout: 4000,
     maxRetries: Infinity,
+    maxEnqueuedMessages: Infinity,
+    startClosed: false,
     debug: false,
 };
 class ReconnectingWebSocket {
@@ -65,12 +67,8 @@ class ReconnectingWebSocket {
         this._shouldReconnect = true;
         this._connectLock = false;
         this._binaryType = 'blob';
-        this.eventToHandler = new Map([
-            ['open', this._handleOpen.bind(this)],
-            ['close', this._handleClose.bind(this)],
-            ['error', this._handleError.bind(this)],
-            ['message', this._handleMessage.bind(this)],
-        ]);
+        this._closeCalled = false;
+        this._messageQueue = [];
         /**
          * An event listener to be called when the WebSocket connection's readyState changes to CLOSED
          */
@@ -88,9 +86,55 @@ class ReconnectingWebSocket {
          * this indicates that the connection is ready to send and receive data
          */
         this.onopen = undefined;
+        this._handleOpen = (event) => {
+            this._debug('open event');
+            const { minUptime = DEFAULT.minUptime } = this._options;
+            _clearTimeout(this._connectTimeout);
+            this._uptimeTimeout = _setTimeout(() => this._acceptOpen(), minUptime);
+            // @ts-ignore
+            this._ws.binaryType = this._binaryType;
+            // send enqueued messages (messages sent before websocket open event)
+            this._messageQueue.forEach(message => this._ws.send(message));
+            this._messageQueue = [];
+            if (this.onopen) {
+                this.onopen(event);
+            }
+            this._listeners.open.forEach(listener => this._callEventListener(event, listener));
+        };
+        this._handleMessage = (event) => {
+            this._debug('message event');
+            if (this.onmessage) {
+                this.onmessage(event);
+            }
+            this._listeners.message.forEach(listener => this._callEventListener(event, listener));
+        };
+        this._handleError = (event) => {
+            this._debug('error event', event.message);
+            this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
+            if (this.onerror) {
+                this.onerror(event);
+            }
+            this._debug('exec error listeners');
+            this._listeners.error.forEach(listener => this._callEventListener(event, listener));
+            this._connect();
+        };
+        this._handleClose = (event) => {
+            this._debug('close event');
+            this._clearTimeouts();
+            if (this._shouldReconnect) {
+                this._connect();
+            }
+            if (this.onclose) {
+                this.onclose(event);
+            }
+            this._listeners.close.forEach(listener => this._callEventListener(event, listener));
+        };
         this._url = url;
         this._protocols = protocols;
         this._options = options;
+        if (this._options.startClosed) {
+            this._shouldReconnect = false;
+        }
         this._connect();
     }
     static get CONNECTING() {
@@ -140,7 +184,19 @@ class ReconnectingWebSocket {
      * this will continue to climb. Read only
      */
     get bufferedAmount() {
-        return this._ws ? this._ws.bufferedAmount : 0;
+        const bytes = this._messageQueue.reduce((acc, message) => {
+            if (typeof message === 'string') {
+                acc += message.length; // not byte size
+            }
+            else if (message instanceof Blob) {
+                acc += message.size;
+            }
+            else {
+                acc += message.byteLength;
+            }
+            return acc;
+        }, 0);
+        return bytes + (this._ws ? this._ws.bufferedAmount : 0);
     }
     /**
      * The extensions selected by the server. This is currently only the empty string or a list of
@@ -161,7 +217,12 @@ class ReconnectingWebSocket {
      * The current state of the connection; this is one of the Ready state constants
      */
     get readyState() {
-        return this._ws ? this._ws.readyState : ReconnectingWebSocket.CONNECTING;
+        if (this._ws) {
+            return this._ws.readyState;
+        }
+        return this._options.startClosed
+            ? ReconnectingWebSocket.CLOSED
+            : ReconnectingWebSocket.CONNECTING;
     }
     /**
      * The URL as resolved by the constructor
@@ -173,9 +234,16 @@ class ReconnectingWebSocket {
      * Closes the WebSocket connection or connection attempt, if any. If the connection is already
      * CLOSED, this method does nothing
      */
-    close(code, reason) {
+    close(code = 1000, reason) {
+        this._closeCalled = true;
         this._shouldReconnect = false;
-        if (!this._ws || this._ws.readyState === this.CLOSED) {
+        this._clearTimeouts();
+        if (!this._ws) {
+            this._debug('close enqueued: no ws instance');
+            return;
+        }
+        if (this._ws.readyState === this.CLOSED) {
+            this._debug('close: already closed');
             return;
         }
         this._ws.close(code, reason);
@@ -186,19 +254,30 @@ class ReconnectingWebSocket {
      */
     reconnect(code, reason) {
         this._shouldReconnect = true;
+        this._closeCalled = false;
         this._retryCount = -1;
         if (!this._ws || this._ws.readyState === this.CLOSED) {
             this._connect();
         }
-        this._disconnect(code, reason);
-        this._connect();
+        else {
+            this._disconnect(code, reason);
+            this._connect();
+        }
     }
     /**
-     * Enqueues the specified data to be transmitted to the server over the WebSocket connection
+     * Enqueue specified data to be transmitted to the server over the WebSocket connection
      */
     send(data) {
-        if (this._ws) {
+        if (this._ws && this._ws.readyState === this.OPEN) {
+            this._debug('send', data);
             this._ws.send(data);
+        }
+        else {
+            const { maxEnqueuedMessages = DEFAULT.maxEnqueuedMessages } = this._options;
+            if (this._messageQueue.length < maxEnqueuedMessages) {
+                this._debug('enqueue', data);
+                this._messageQueue.push(data);
+            }
         }
     }
     /**
@@ -219,18 +298,19 @@ class ReconnectingWebSocket {
             this._listeners[type] = this._listeners[type].filter(l => l !== listener);
         }
     }
-    _debug(...params) {
+    _debug(...args) {
         if (this._options.debug) {
+            // not using spread because compiled version uses Symbols
             // tslint:disable-next-line
-            console.log('RWS>', ...params);
+            console.log.apply(console, ['RWS>', ...args]);
         }
     }
     _getNextDelay() {
+        const { reconnectionDelayGrowFactor = DEFAULT.reconnectionDelayGrowFactor, minReconnectionDelay = DEFAULT.minReconnectionDelay, maxReconnectionDelay = DEFAULT.maxReconnectionDelay, } = this._options;
         let delay = 0;
         if (this._retryCount > 0) {
-            const { reconnectionDelayGrowFactor = DEFAULT.reconnectionDelayGrowFactor, minReconnectionDelay = DEFAULT.minReconnectionDelay, maxReconnectionDelay = DEFAULT.maxReconnectionDelay, } = this._options;
             delay =
-                minReconnectionDelay + Math.pow(this._retryCount - 1, reconnectionDelayGrowFactor);
+                minReconnectionDelay * Math.pow(reconnectionDelayGrowFactor, this._retryCount - 1);
             if (delay > maxReconnectionDelay) {
                 delay = maxReconnectionDelay;
             }
@@ -243,9 +323,6 @@ class ReconnectingWebSocket {
             _setTimeout(resolve, this._getNextDelay());
         });
     }
-    /**
-     * @return Promise<string>
-     */
     _getNextUrl(urlProvider) {
         if (typeof urlProvider === 'string') {
             return Promise.resolve(urlProvider);
@@ -280,8 +357,14 @@ class ReconnectingWebSocket {
         this._wait()
             .then(() => this._getNextUrl(this._url))
             .then(url => {
+            // close could be called before creating the ws
+            if (this._closeCalled) {
+                return;
+            }
             this._debug('connect', { url, protocols: this._protocols });
-            this._ws = new WebSocket(url, this._protocols);
+            this._ws = this._protocols
+                ? new WebSocket(url, this._protocols)
+                : new WebSocket(url);
             // @ts-ignore
             this._ws.binaryType = this._binaryType;
             this._connectLock = false;
@@ -293,8 +376,8 @@ class ReconnectingWebSocket {
         this._debug('timeout event');
         this._handleError(new ErrorEvent(Error('TIMEOUT'), this));
     }
-    _disconnect(code, reason) {
-        _clearTimeout(this._connectTimeout);
+    _disconnect(code = 1000, reason) {
+        this._clearTimeouts();
         if (!this._ws) {
             return;
         }
@@ -308,65 +391,44 @@ class ReconnectingWebSocket {
         }
     }
     _acceptOpen() {
+        this._debug('accept open');
         this._retryCount = 0;
     }
-    _handleOpen(event) {
-        this._debug('open event');
-        const { minUptime = DEFAULT.minUptime } = this._options;
-        _clearTimeout(this._connectTimeout);
-        this._uptimeTimeout = _setTimeout(() => this._acceptOpen(), minUptime);
-        this._debug('assign binary type');
-        // @ts-ignore
-        this._ws.binaryType = this._binaryType;
-        if (this.onopen) {
-            this.onopen(event);
+    _callEventListener(event, listener) {
+        if ('handleEvent' in listener) {
+            // @ts-ignore
+            listener.handleEvent(event);
         }
-        this._listeners.open.forEach(listener => listener(event));
-    }
-    _handleMessage(event) {
-        this._debug('message event');
-        if (this.onmessage) {
-            this.onmessage(event);
+        else {
+            // @ts-ignore
+            listener(event);
         }
-        this._listeners.message.forEach(listener => listener(event));
     }
-    _handleError(event) {
-        this._debug('error event', event.message);
-        this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
-        if (this.onerror) {
-            this.onerror(event);
-        }
-        this._debug('exec error listeners');
-        this._listeners.error.forEach(listener => listener(event));
-        this._connect();
-    }
-    _handleClose(event) {
-        this._debug('close event');
-        if (this.onclose) {
-            this.onclose(event);
-        }
-        this._listeners.close.forEach(listener => listener(event));
-    }
-    /**
-     * Remove event listeners to WebSocket instance
-     */
     _removeListeners() {
         if (!this._ws) {
             return;
         }
         this._debug('removeListeners');
-        for (const [type, handler] of this.eventToHandler) {
-            this._ws.removeEventListener(type, handler);
-        }
+        this._ws.removeEventListener('open', this._handleOpen);
+        this._ws.removeEventListener('close', this._handleClose);
+        this._ws.removeEventListener('message', this._handleMessage);
+        // @ts-ignore
+        this._ws.removeEventListener('error', this._handleError);
     }
-    /**
-     * Assign event listeners to WebSocket instance
-     */
     _addListeners() {
-        this._debug('addListeners');
-        for (const [type, handler] of this.eventToHandler) {
-            this._ws.addEventListener(type, handler);
+        if (!this._ws) {
+            return;
         }
+        this._debug('addListeners');
+        this._ws.addEventListener('open', this._handleOpen);
+        this._ws.addEventListener('close', this._handleClose);
+        this._ws.addEventListener('message', this._handleMessage);
+        // @ts-ignore
+        this._ws.addEventListener('error', this._handleError);
+    }
+    _clearTimeouts() {
+        _clearTimeout(this._connectTimeout);
+        _clearTimeout(this._uptimeTimeout);
     }
 }
 

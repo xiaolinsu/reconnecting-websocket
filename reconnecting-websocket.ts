@@ -4,11 +4,19 @@
  * https://github.com/pladaria/reconnecting-websocket
  * License MIT
  */
-import {CloseEvent, ErrorEvent, Event, EventListener, WebSocketEventMap} from './events';
+import {
+    CloseEvent,
+    ErrorEvent,
+    Event,
+    WebSocketEventListenerMap,
+    WebSocketEventMap,
+} from './events';
+
 import RNTimer from "react-native-background-timer";
 
 const _setTimeout = RNTimer ? (callback: () => void, time: number) => RNTimer.setTimeout(callback, time) : setTimeout;
 const _clearTimeout = RNTimer ? (time: number) => RNTimer.clearTimeout(time) : clearTimeout;
+
 
 const getGlobalWebSocket = (): WebSocket | undefined => {
     if (typeof WebSocket !== 'undefined') {
@@ -20,7 +28,11 @@ const getGlobalWebSocket = (): WebSocket | undefined => {
 /**
  * Returns true if given argument looks like a WebSocket class
  */
-const isWebSocket = (w: any) => typeof w === 'function' && w.CLOSING === 2;
+const isWebSocket = (w: any) => typeof w !== 'undefined' && !!w && w.CLOSING === 2;
+
+export type Event = Event;
+export type ErrorEvent = ErrorEvent;
+export type CloseEvent = CloseEvent;
 
 export type Options = {
     WebSocket?: any;
@@ -30,6 +42,8 @@ export type Options = {
     minUptime?: number;
     connectionTimeout?: number;
     maxRetries?: number;
+    maxEnqueuedMessages?: number;
+    startClosed?: boolean;
     debug?: boolean;
 };
 
@@ -40,17 +54,22 @@ const DEFAULT = {
     reconnectionDelayGrowFactor: 1.3,
     connectionTimeout: 4000,
     maxRetries: Infinity,
+    maxEnqueuedMessages: Infinity,
+    startClosed: false,
     debug: false,
 };
 
 export type UrlProvider = string | (() => string) | (() => Promise<string>);
 
+export type Message = string | ArrayBuffer | Blob | ArrayBufferView;
+
 export type ListenersMap = {
-    error: Array<((event: ErrorEvent) => void)>;
-    message: Array<((event: MessageEvent) => void)>;
-    open: Array<((event: Event) => void)>;
-    close: Array<((event: CloseEvent) => void)>;
+    error: Array<WebSocketEventListenerMap['error']>;
+    message: Array<WebSocketEventListenerMap['message']>;
+    open: Array<WebSocketEventListenerMap['open']>;
+    close: Array<WebSocketEventListenerMap['close']>;
 };
+
 export default class ReconnectingWebSocket {
     private _ws?: WebSocket;
     private _listeners: ListenersMap = {
@@ -65,22 +84,20 @@ export default class ReconnectingWebSocket {
     private _shouldReconnect = true;
     private _connectLock = false;
     private _binaryType = 'blob';
+    private _closeCalled = false;
+    private _messageQueue: Message[] = [];
 
     private readonly _url: UrlProvider;
     private readonly _protocols?: string | string[];
     private readonly _options: Options;
 
-    private readonly eventToHandler = new Map<keyof WebSocketEventMap, any>([
-        ['open', this._handleOpen.bind(this)],
-        ['close', this._handleClose.bind(this)],
-        ['error', this._handleError.bind(this)],
-        ['message', this._handleMessage.bind(this)],
-    ]);
-
     constructor(url: UrlProvider, protocols?: string | string[], options: Options = {}) {
         this._url = url;
         this._protocols = protocols;
         this._options = options;
+        if (this._options.startClosed) {
+            this._shouldReconnect = false;
+        }
         this._connect();
     }
 
@@ -136,7 +153,17 @@ export default class ReconnectingWebSocket {
      * this will continue to climb. Read only
      */
     get bufferedAmount(): number {
-        return this._ws ? this._ws.bufferedAmount : 0;
+        const bytes = this._messageQueue.reduce((acc, message) => {
+            if (typeof message === 'string') {
+                acc += message.length; // not byte size
+            } else if (message instanceof Blob) {
+                acc += message.size;
+            } else {
+                acc += message.byteLength;
+            }
+            return acc;
+        }, 0);
+        return bytes + (this._ws ? this._ws.bufferedAmount : 0);
     }
 
     /**
@@ -160,7 +187,12 @@ export default class ReconnectingWebSocket {
      * The current state of the connection; this is one of the Ready state constants
      */
     get readyState(): number {
-        return this._ws ? this._ws.readyState : ReconnectingWebSocket.CONNECTING;
+        if (this._ws) {
+            return this._ws.readyState;
+        }
+        return this._options.startClosed
+            ? ReconnectingWebSocket.CLOSED
+            : ReconnectingWebSocket.CONNECTING;
     }
 
     /**
@@ -178,7 +210,7 @@ export default class ReconnectingWebSocket {
     /**
      * An event listener to be called when an error occurs
      */
-    public onerror?: (event: Event) => void = undefined;
+    public onerror?: (event: ErrorEvent) => void = undefined;
 
     /**
      * An event listener to be called when a message is received from the server
@@ -195,9 +227,16 @@ export default class ReconnectingWebSocket {
      * Closes the WebSocket connection or connection attempt, if any. If the connection is already
      * CLOSED, this method does nothing
      */
-    public close(code?: number, reason?: string) {
+    public close(code: number = 1000, reason?: string) {
+        this._closeCalled = true;
         this._shouldReconnect = false;
-        if (!this._ws || this._ws.readyState === this.CLOSED) {
+        this._clearTimeouts();
+        if (!this._ws) {
+            this._debug('close enqueued: no ws instance');
+            return;
+        }
+        if (this._ws.readyState === this.CLOSED) {
+            this._debug('close: already closed');
             return;
         }
         this._ws.close(code, reason);
@@ -209,29 +248,38 @@ export default class ReconnectingWebSocket {
      */
     public reconnect(code?: number, reason?: string) {
         this._shouldReconnect = true;
+        this._closeCalled = false;
         this._retryCount = -1;
         if (!this._ws || this._ws.readyState === this.CLOSED) {
             this._connect();
+        } else {
+            this._disconnect(code, reason);
+            this._connect();
         }
-        this._disconnect(code, reason);
-        this._connect();
     }
 
     /**
-     * Enqueues the specified data to be transmitted to the server over the WebSocket connection
+     * Enqueue specified data to be transmitted to the server over the WebSocket connection
      */
-    public send(data: string | ArrayBuffer | Blob | ArrayBufferView) {
-        if (this._ws) {
+    public send(data: Message) {
+        if (this._ws && this._ws.readyState === this.OPEN) {
+            this._debug('send', data);
             this._ws.send(data);
+        } else {
+            const {maxEnqueuedMessages = DEFAULT.maxEnqueuedMessages} = this._options;
+            if (this._messageQueue.length < maxEnqueuedMessages) {
+                this._debug('enqueue', data);
+                this._messageQueue.push(data);
+            }
         }
     }
 
     /**
      * Register an event handler of a specific event type
      */
-    public addEventListener<K extends keyof WebSocketEventMap>(
-        type: K,
-        listener: ((event: WebSocketEventMap[K]) => void),
+    public addEventListener<T extends keyof WebSocketEventListenerMap>(
+        type: T,
+        listener: WebSocketEventListenerMap[T],
     ): void {
         if (this._listeners[type]) {
             // @ts-ignore
@@ -242,9 +290,9 @@ export default class ReconnectingWebSocket {
     /**
      * Removes an event listener
      */
-    public removeEventListener<K extends keyof WebSocketEventMap>(
-        type: K,
-        listener: ((event: WebSocketEventMap[K]) => void),
+    public removeEventListener<T extends keyof WebSocketEventListenerMap>(
+        type: T,
+        listener: WebSocketEventListenerMap[T],
     ): void {
         if (this._listeners[type]) {
             // @ts-ignore
@@ -252,24 +300,24 @@ export default class ReconnectingWebSocket {
         }
     }
 
-    private _debug(...params: any[]) {
+    private _debug(...args: any[]) {
         if (this._options.debug) {
+            // not using spread because compiled version uses Symbols
             // tslint:disable-next-line
-            console.log('RWS>', ...params);
+            console.log.apply(console, ['RWS>', ...args]);
         }
     }
 
     private _getNextDelay() {
+        const {
+            reconnectionDelayGrowFactor = DEFAULT.reconnectionDelayGrowFactor,
+            minReconnectionDelay = DEFAULT.minReconnectionDelay,
+            maxReconnectionDelay = DEFAULT.maxReconnectionDelay,
+        } = this._options;
         let delay = 0;
         if (this._retryCount > 0) {
-            const {
-                reconnectionDelayGrowFactor = DEFAULT.reconnectionDelayGrowFactor,
-                minReconnectionDelay = DEFAULT.minReconnectionDelay,
-                maxReconnectionDelay = DEFAULT.maxReconnectionDelay,
-            } = this._options;
-
             delay =
-                minReconnectionDelay + Math.pow(this._retryCount - 1, reconnectionDelayGrowFactor);
+                minReconnectionDelay * Math.pow(reconnectionDelayGrowFactor, this._retryCount - 1);
             if (delay > maxReconnectionDelay) {
                 delay = maxReconnectionDelay;
             }
@@ -284,9 +332,6 @@ export default class ReconnectingWebSocket {
         });
     }
 
-    /**
-     * @return Promise<string>
-     */
     private _getNextUrl(urlProvider: UrlProvider): Promise<string> {
         if (typeof urlProvider === 'string') {
             return Promise.resolve(urlProvider);
@@ -308,6 +353,7 @@ export default class ReconnectingWebSocket {
             return;
         }
         this._connectLock = true;
+
         const {
             maxRetries = DEFAULT.maxRetries,
             connectionTimeout = DEFAULT.connectionTimeout,
@@ -329,12 +375,19 @@ export default class ReconnectingWebSocket {
         this._wait()
             .then(() => this._getNextUrl(this._url))
             .then(url => {
+                // close could be called before creating the ws
+                if (this._closeCalled) {
+                    return;
+                }
                 this._debug('connect', {url, protocols: this._protocols});
-                this._ws = new WebSocket(url, this._protocols);
+                this._ws = this._protocols
+                    ? new WebSocket(url, this._protocols)
+                    : new WebSocket(url);
                 // @ts-ignore
                 this._ws!.binaryType = this._binaryType;
                 this._connectLock = false;
                 this._addListeners();
+
                 this._connectTimeout = _setTimeout(() => this._handleTimeout(), connectionTimeout);
             });
     }
@@ -344,8 +397,8 @@ export default class ReconnectingWebSocket {
         this._handleError(new ErrorEvent(Error('TIMEOUT'), this));
     }
 
-    private _disconnect(code?: number, reason?: string) {
-        _clearTimeout(this._connectTimeout);
+    private _disconnect(code: number = 1000, reason?: string) {
+        this._clearTimeouts();
         if (!this._ws) {
             return;
         }
@@ -359,36 +412,53 @@ export default class ReconnectingWebSocket {
     }
 
     private _acceptOpen() {
+        this._debug('accept open');
         this._retryCount = 0;
     }
 
-    private _handleOpen(event: Event) {
+    private _callEventListener<T extends keyof WebSocketEventListenerMap>(
+        event: WebSocketEventMap[T],
+        listener: WebSocketEventListenerMap[T],
+    ) {
+        if ('handleEvent' in listener) {
+            // @ts-ignore
+            listener.handleEvent(event);
+        } else {
+            // @ts-ignore
+            listener(event);
+        }
+    }
+
+    private _handleOpen = (event: Event) => {
         this._debug('open event');
         const {minUptime = DEFAULT.minUptime} = this._options;
 
         _clearTimeout(this._connectTimeout);
         this._uptimeTimeout = _setTimeout(() => this._acceptOpen(), minUptime);
 
-        this._debug('assign binary type');
         // @ts-ignore
         this._ws!.binaryType = this._binaryType;
+
+        // send enqueued messages (messages sent before websocket open event)
+        this._messageQueue.forEach(message => this._ws!.send(message));
+        this._messageQueue = [];
 
         if (this.onopen) {
             this.onopen(event);
         }
-        this._listeners.open.forEach(listener => listener(event));
-    }
+        this._listeners.open.forEach(listener => this._callEventListener(event, listener));
+    };
 
-    private _handleMessage(event: MessageEvent) {
+    private _handleMessage = (event: MessageEvent) => {
         this._debug('message event');
 
         if (this.onmessage) {
             this.onmessage(event);
         }
-        this._listeners.message.forEach(listener => listener(event));
-    }
+        this._listeners.message.forEach(listener => this._callEventListener(event, listener));
+    };
 
-    private _handleError(event: ErrorEvent) {
+    private _handleError = (event: ErrorEvent) => {
         this._debug('error event', event.message);
         this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
 
@@ -396,40 +466,51 @@ export default class ReconnectingWebSocket {
             this.onerror(event);
         }
         this._debug('exec error listeners');
-        this._listeners.error.forEach(listener => listener(event));
+        this._listeners.error.forEach(listener => this._callEventListener(event, listener));
 
         this._connect();
-    }
+    };
 
-    private _handleClose(event: CloseEvent) {
+    private _handleClose = (event: CloseEvent) => {
         this._debug('close event');
+        this._clearTimeouts();
+
+        if (this._shouldReconnect) {
+            this._connect();
+        }
 
         if (this.onclose) {
             this.onclose(event);
         }
-        this._listeners.close.forEach(listener => listener(event));
-    }
+        this._listeners.close.forEach(listener => this._callEventListener(event, listener));
+    };
 
-    /**
-     * Remove event listeners to WebSocket instance
-     */
     private _removeListeners() {
         if (!this._ws) {
             return;
         }
         this._debug('removeListeners');
-        for (const [type, handler] of this.eventToHandler) {
-            this._ws.removeEventListener(type, handler);
-        }
+        this._ws.removeEventListener('open', this._handleOpen);
+        this._ws.removeEventListener('close', this._handleClose);
+        this._ws.removeEventListener('message', this._handleMessage);
+        // @ts-ignore
+        this._ws.removeEventListener('error', this._handleError);
     }
 
-    /**
-     * Assign event listeners to WebSocket instance
-     */
     private _addListeners() {
-        this._debug('addListeners');
-        for (const [type, handler] of this.eventToHandler) {
-            this._ws!.addEventListener(type, handler);
+        if (!this._ws) {
+            return;
         }
+        this._debug('addListeners');
+        this._ws.addEventListener('open', this._handleOpen);
+        this._ws.addEventListener('close', this._handleClose);
+        this._ws.addEventListener('message', this._handleMessage);
+        // @ts-ignore
+        this._ws.addEventListener('error', this._handleError);
+    }
+
+    private _clearTimeouts() {
+        _clearTimeout(this._connectTimeout);
+        _clearTimeout(this._uptimeTimeout);
     }
 }

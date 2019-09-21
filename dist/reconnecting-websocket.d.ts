@@ -4,7 +4,10 @@
  * https://github.com/pladaria/reconnecting-websocket
  * License MIT
  */
-import { CloseEvent, ErrorEvent, Event, WebSocketEventMap } from './events';
+import { CloseEvent, ErrorEvent, Event, WebSocketEventListenerMap } from './events';
+export declare type Event = Event;
+export declare type ErrorEvent = ErrorEvent;
+export declare type CloseEvent = CloseEvent;
 export declare type Options = {
     WebSocket?: any;
     maxReconnectionDelay?: number;
@@ -13,14 +16,17 @@ export declare type Options = {
     minUptime?: number;
     connectionTimeout?: number;
     maxRetries?: number;
+    maxEnqueuedMessages?: number;
+    startClosed?: boolean;
     debug?: boolean;
 };
 export declare type UrlProvider = string | (() => string) | (() => Promise<string>);
+export declare type Message = string | ArrayBuffer | Blob | ArrayBufferView;
 export declare type ListenersMap = {
-    error: Array<((event: ErrorEvent) => void)>;
-    message: Array<((event: MessageEvent) => void)>;
-    open: Array<((event: Event) => void)>;
-    close: Array<((event: CloseEvent) => void)>;
+    error: Array<WebSocketEventListenerMap['error']>;
+    message: Array<WebSocketEventListenerMap['message']>;
+    open: Array<WebSocketEventListenerMap['open']>;
+    close: Array<WebSocketEventListenerMap['close']>;
 };
 export default class ReconnectingWebSocket {
     private _ws?;
@@ -31,10 +37,11 @@ export default class ReconnectingWebSocket {
     private _shouldReconnect;
     private _connectLock;
     private _binaryType;
+    private _closeCalled;
+    private _messageQueue;
     private readonly _url;
     private readonly _protocols?;
     private readonly _options;
-    private readonly eventToHandler;
     constructor(url: UrlProvider, protocols?: string | string[], options?: Options);
     static readonly CONNECTING: number;
     static readonly OPEN: number;
@@ -82,7 +89,7 @@ export default class ReconnectingWebSocket {
     /**
      * An event listener to be called when an error occurs
      */
-    onerror?: (event: Event) => void;
+    onerror?: (event: ErrorEvent) => void;
     /**
      * An event listener to be called when a message is received from the server
      */
@@ -103,38 +110,31 @@ export default class ReconnectingWebSocket {
      */
     reconnect(code?: number, reason?: string): void;
     /**
-     * Enqueues the specified data to be transmitted to the server over the WebSocket connection
+     * Enqueue specified data to be transmitted to the server over the WebSocket connection
      */
-    send(data: string | ArrayBuffer | Blob | ArrayBufferView): void;
+    send(data: Message): void;
     /**
      * Register an event handler of a specific event type
      */
-    addEventListener<K extends keyof WebSocketEventMap>(type: K, listener: ((event: WebSocketEventMap[K]) => void)): void;
+    addEventListener<T extends keyof WebSocketEventListenerMap>(type: T, listener: WebSocketEventListenerMap[T]): void;
     /**
      * Removes an event listener
      */
-    removeEventListener<K extends keyof WebSocketEventMap>(type: K, listener: ((event: WebSocketEventMap[K]) => void)): void;
+    removeEventListener<T extends keyof WebSocketEventListenerMap>(type: T, listener: WebSocketEventListenerMap[T]): void;
     private _debug;
     private _getNextDelay;
     private _wait;
-    /**
-     * @return Promise<string>
-     */
     private _getNextUrl;
     private _connect;
     private _handleTimeout;
     private _disconnect;
     private _acceptOpen;
+    private _callEventListener;
     private _handleOpen;
     private _handleMessage;
     private _handleError;
     private _handleClose;
-    /**
-     * Remove event listeners to WebSocket instance
-     */
     private _removeListeners;
-    /**
-     * Assign event listeners to WebSocket instance
-     */
     private _addListeners;
+    private _clearTimeouts;
 }
