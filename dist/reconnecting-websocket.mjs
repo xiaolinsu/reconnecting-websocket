@@ -105,7 +105,7 @@ class ReconnectingWebSocket {
             this._listeners.message.forEach(listener => this._callEventListener(event, listener));
         };
         this._handleError = (event) => {
-            this._debug('error event', event.message);
+            this._debug('error event', event);
             this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
             if (this.onerror) {
                 this.onerror(event);
@@ -364,8 +364,8 @@ class ReconnectingWebSocket {
             // @ts-ignore
             this._ws.binaryType = this._binaryType;
             this._connectLock = false;
-            this._addListeners();
             this._connectTimeout = _setTimeout(() => this._handleTimeout(), connectionTimeout);
+            this._addListeners();
         });
     }
     _handleTimeout() {
