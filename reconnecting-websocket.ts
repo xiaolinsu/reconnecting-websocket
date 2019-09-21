@@ -459,18 +459,17 @@ export default class ReconnectingWebSocket {
 
     private _handleError = (event: ErrorEvent) => {
         this._debug('error event', event);
-        if (event.hasOwnProperty("isTrusted")){
-            return;
-        }
-        this._debug('error event', "into reconnect");
-        this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
         if (this.onerror) {
             this.onerror(event);
         }
         this._debug('exec error listeners');
         this._listeners.error.forEach(listener => this._callEventListener(event, listener));
-
-        this._connect();
+        if (event.message === 'TIMEOUT'){
+            this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
+            if (this._shouldReconnect) {
+                this._connect();
+            }
+        }
     };
 
     private _handleClose = (event: CloseEvent) => {
