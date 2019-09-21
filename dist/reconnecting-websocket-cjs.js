@@ -110,6 +110,10 @@ class ReconnectingWebSocket {
         };
         this._handleError = (event) => {
             this._debug('error event', event);
+            if (event.hasOwnProperty("isTrusted")) {
+                return;
+            }
+            this._debug('error event', "into reconnect");
             this._disconnect(undefined, event.message === 'TIMEOUT' ? 'timeout' : undefined);
             if (this.onerror) {
                 this.onerror(event);
