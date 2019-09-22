@@ -165,6 +165,9 @@ class ReconnectingWebSocket {
     get CLOSED() {
         return ReconnectingWebSocket.CLOSED;
     }
+    get rawClient() {
+        return this._ws;
+    }
     get binaryType() {
         return this._ws ? this._ws.binaryType : this._binaryType;
     }

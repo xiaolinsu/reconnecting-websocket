@@ -51,6 +51,7 @@ export default class ReconnectingWebSocket {
     readonly OPEN: number;
     readonly CLOSING: number;
     readonly CLOSED: number;
+    readonly rawClient: WebSocket | undefined;
     binaryType: string;
     /**
      * Returns the number or connection retries
