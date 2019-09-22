@@ -127,6 +127,10 @@ export default class ReconnectingWebSocket {
         return ReconnectingWebSocket.CLOSED;
     }
 
+    get rawClient(): WebSocket {
+        return this._ws;
+    }
+    
     get binaryType(): string {
         return this._ws ? this._ws.binaryType : this._binaryType;
     }
